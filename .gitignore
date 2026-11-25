@@ -1,0 +1,21 @@
+# Compiled binaries from `go build`
+/your-cli-tool-name
+/your-cli-tool-name.exe
+/your-cli-tool-name-linux
+/your-cli-tool-name-darwin
+
+# Test and profiling files
+*.test
+*.prof
+
+# Go workspace files
+go.work
+go.work.sum
+
+# IDE and OS files
+.vscode/
+.idea/
+.DS_Store
+# Secrets and build artifacts
+serviceAccountKey.json
+*.exe
