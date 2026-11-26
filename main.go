@@ -43,7 +43,7 @@ func main() {
 		if r := recover(); r != nil {
 			log.Printf("💥 FATAL PANIC: %v", r)
 		}
-	}()whwh
+	}()
 
 	exePath, _ := os.Executable()
 	exeDir := filepath.Dir(exePath)
